@@ -1,5 +1,6 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events, EmbedBuilder } from 'discord.js';
+import { spawn } from 'child_process';
+import { Client, GatewayIntentBits, Events } from 'discord.js';
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -7,7 +8,6 @@ import {
   AudioPlayerStatus,
   StreamType
 } from '@discordjs/voice';
-import ytdl from 'ytdl-core';
 
 const client = new Client({
   intents: [
@@ -18,70 +18,94 @@ const client = new Client({
   ]
 });
 
-const player = createAudioPlayer();
-const PREFIX = process.env.PREFIX;
-
 client.once(Events.ClientReady, () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
+process.on('unhandledRejection', console.error);
+client.on('error', console.error);
+
 client.on(Events.MessageCreate, async msg => {
-  if (msg.author.bot || !msg.content.startsWith(PREFIX)) return;
+  if (msg.author.bot) return;
+  const prefix = '!play ';
+  if (!msg.content.toLowerCase().startsWith(prefix)) return;
 
-  const [cmd, ...args] = msg.content
-    .slice(PREFIX.length)
-    .trim()
-    .split(/\s+/);
+  const raw = msg.content.slice(prefix.length).trim().split(/\s+/)[0];
+  if (!raw) return msg.reply('Укажи ссылку: `!play https://www.youtube.com/watch?v=...`');
 
-  if (cmd === 'play') {
-    const url = args[0];
-    if (!url || !ytdl.validateURL(url))
-      return msg.reply('Нужна корректная ссылка на YouTube!');
+  // чистка <...> и пробелов
+  const url = raw.replace(/^<|>$/g, '').trim();
+  console.log('→ Playing URL:', url);
 
-    const channel = msg.member.voice.channel;
-    if (!channel)
-      return msg.reply('Зайди в голосовой канал, чтобы я мог играть музыку.');
+  // базовая валидация
+  try {
+    new URL(url);
+  } catch {
+    return msg.reply('Невалидный URL. Проверь опечатки.');
+  }
 
-    const conn = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: msg.guildId,
-      adapterCreator: msg.guild.voiceAdapterCreator
+  // проверка параметра v=...
+  const match = url.match(/[?&]v=([^&]+)/);
+  if (!match) {
+    return msg.reply('Нужно именно видео-URL (с параметром v=...).');
+  }
+  const cleanUrl = `https://www.youtube.com/watch?v=${match[1]}`;
+
+  // спавним yt-dlp
+  let ytdlp;
+  try {
+    ytdlp = spawn('yt-dlp', [
+      '-f', 'bestaudio',
+      '-o', '-',       // в stdout
+      '--quiet',       // без логов
+      cleanUrl
+    ], {
+      stdio: ['ignore', 'pipe', 'inherit']
     });
+  } catch (err) {
+    console.error('Не удалось запустить yt-dlp:', err);
+    return msg.reply('Проблема с запуском yt-dlp. Установи его глобально.');
+  }
 
-    const stream = ytdl(url, { filter: 'audioonly', highWaterMark: 1<<25 });
-    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+  const stream = ytdlp.stdout;
+  if (!stream) {
+    return msg.reply('Не могу получить поток от yt-dlp.');
+  }
 
-    player.play(resource);
-    conn.subscribe(player);
+  const channel = msg.member.voice.channel;
+  if (!channel) return msg.reply('Зайди в голосовой канал.');
 
-    player.once(AudioPlayerStatus.Playing, () => {
-      msg.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle('▶️ Играем сейчас')
-            .setDescription(`${url}`)
-            .setColor('Blue')
-        ]
-      });
-    });
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: msg.guild.id,
+    adapterCreator: msg.guild.voiceAdapterCreator
+  });
 
-    player.once(AudioPlayerStatus.Idle, () => conn.destroy());
-    player.on('error', error => {
-      console.error(error);
+  const resource = createAudioResource(stream, {
+    inputType: StreamType.Arbitrary,
+    inlineVolume: true
+  });
+
+  let destroyed = false;
+  const destroyConn = () => {
+    if (!destroyed) {
+      destroyed = true;
+      connection.destroy();
+    }
+  };
+
+  const player = createAudioPlayer()
+    .once(AudioPlayerStatus.Idle, destroyConn)
+    .once('error', err => {
+      console.error('Audio player error:', err);
       msg.reply('Ошибка при воспроизведении.');
-      conn.destroy();
+      destroyConn();
     });
-  }
 
-  if (cmd === 'skip') {
-    player.stop();
-    msg.reply('⏭️ Пропускаю трек.');
-  }
+  connection.subscribe(player);
+  player.play(resource);
 
-  if (cmd === 'stop') {
-    player.stop();
-    msg.reply('⏹️ Останавливаюсь и выхожу.');
-  }
+  return msg.reply(`▶️ Играю: ${match[1]}`);
 });
 
 client.login(process.env.DISCORD_TOKEN);

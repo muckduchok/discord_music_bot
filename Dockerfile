@@ -1,11 +1,11 @@
-FROM node:18-alpine
+FROM node:18-bullseye
+
+# Устанавливаем ffmpeg в контейнер
+RUN apt-get update && apt-get install -y ffmpeg
 
 WORKDIR /bot
-
-# Копируем только манифесты, чтобы закешировать npm install
-COPY package.json package-lock.json ./
+COPY package*.json ./
 RUN npm ci --production
-
 COPY . .
 
 CMD ["npm", "start"]
