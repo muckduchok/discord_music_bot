@@ -55,13 +55,12 @@ client.on(Events.MessageCreate, async msg => {
   let ytdlp;
   try {
     ytdlp = spawn('yt-dlp', [
+      '--cookies-from-browser', 'chrome',  // или 'firefox'
       '-f', 'bestaudio',
-      '-o', '-',       // в stdout
-      '--quiet',       // без логов
+      '-o', '-',
+      '--quiet',
       cleanUrl
-    ], {
-      stdio: ['ignore', 'pipe', 'inherit']
-    });
+    ], { stdio: ['ignore','pipe','inherit'] });
   } catch (err) {
     console.error('Не удалось запустить yt-dlp:', err);
     return msg.reply('Проблема с запуском yt-dlp. Установи его глобально.');
