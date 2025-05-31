@@ -1,15 +1,13 @@
 version: "3.8"
 
 services:
-  discord-music-bot:
-    build: .
-    container_name: discord_music_bot
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-music-bot
     restart: unless-stopped
-    environment:
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - CHROME_COOCKIES=${CHROME_COOCKIES}
+    env_file:
+      - .env
     volumes:
-      # Монтируем локальную папку со всеми файлами внутрь /app
       - ./:/app
-    tty: false
-    stdin_open: false

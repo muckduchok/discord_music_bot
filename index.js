@@ -1,92 +1,169 @@
 // index.js
 import 'dotenv/config';
-import { Client, GatewayIntentBits } from 'discord.js';
-import { Player, QueryType, QueueRepeatMode } from 'discord-player';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  InteractionType
+} from 'discord.js';
+
+import DiscordPlayer from 'discord-player';
+import { YoutubeiExtractor } from "discord-player-youtubei"
+const { Player, useQueue, QueryType } = DiscordPlayer;
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+    GatewayIntentBits.MessageContent
+  ]
 });
 
+// 1) Инициализируем плеер
 const player = new Player(client, {
+  ytdlDownloadOptions: {},
   ytdlOptions: {
-    // можно уточнить опции, но по умолчанию Discord Player сам
-    // попытается использовать yt-dlp и cookies, если нужно
     filter: 'audioonly',
     quality: 'highestaudio',
-    highWaterMark: 1 << 25,
-  },
-  // опционально: можно настроить, как обрабатывать плейлисты, очередь и т.п.
-  // extractors: [ new YtDlpExtractor() ]  // в новых версиях он идёт “из коробки”
+    highWaterMark: 1 << 25
+  }
 });
 
-client.once('ready', () => {
+player.extractors.register(YoutubeiExtractor, {});
+
+client.once(Events.ClientReady, () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-client.on('messageCreate', async (msg) => {
+player.events.on('playerError', (queue, error) => {
+  console.error(`Ошибка в ${queue.guild.name}: ${error.message}`);
+  queue.metadata.channel.send('❌ Произошла ошибка при воспроизведении.');
+});
+
+// 4) При старте трека отправляем сообщение
+player.events.on('playerStart', (queue, track) => {
+  queue.metadata.channel.send(`▶️ Начал играть: **${track.title}**`);
+});
+
+// 5) Обработка команды !play
+client.on(Events.MessageCreate, async (msg) => {
   if (msg.author.bot || !msg.content.startsWith('!play ')) return;
 
-  // забираем аргумент после "!play "
+  // а) Извлекаем текст после «!play »
   const query = msg.content.slice('!play '.length).trim();
-  if (!query) return msg.reply('Укажи, что играть, например: `!play Never Gonna Give You Up`');
-
-  // получаем очередь (создадим, если ещё нет)
-  const queue = player.createQueue(msg.guild, {
-    metadata: {
-      channel: msg.channel,
-      requestedBy: msg.author.username,
-    },
-    // указываем, что делать, если в очереди несколько треков
-    leaveOnEnd: false,
-    leaveOnEmpty: true,
-    leaveOnStop: true,
-    leaveOnEmptyCooldown: 300000, // 5 минут
-  });
-
-  try {
-    if (!queue.connection) await queue.connect(msg.member.voice.channel);
-  } catch {
-    return msg.reply('Не смог подключиться к вашему голосовому каналу.');
+  if (!query) {
+    return msg.reply('❌ Укажи, что проигрывать: `!play <YouTube URL или текст>`');
   }
 
-  // ищем трек (queryType можно “auto”, можно “video” для прямых ссылок)
-  const searchResult = await player
-    .search(query, {
-      requestedBy: msg.author.username,
-      searchEngine: QueryType.AUTO,
-    })
-    .catch(() => null);
+  // б) Проверяем, что пользователь в голосовом канале
+  const voiceChannel = msg.member.voice.channel;
+  if (!voiceChannel) {
+    return msg.reply('❌ Сначала зайди в голосовой канал.');
+  }
 
-  if (!searchResult || !searchResult.tracks.length)
-    return msg.reply('Ничего не найдено по запросу.');
+  // в) Создаём (или достаём) очередь (Queue) для этой гильдии
+  const queue = player.nodes.create(msg.guild, {
+    metadata: {
+      channel: msg.channel,
+      voiceChannel: voiceChannel
+    },
+    leaveOnEnd: false,          // не выходить, когда очередь кончилась
+    leaveOnEmpty: true,         // выйти, если канал пуст
+    leaveOnEmptyCooldown: 300000 // 5 минут
+  });
 
-  // добавляем первый трек в очередь
+  if (!queue.connection) {
+    try {
+      await queue.connect(voiceChannel);
+    } catch (err) {
+      console.error('Не удалось подключиться к голосовому каналу:', err);
+      return msg.reply('❌ Не удалось подключиться к голосовому каналу.');
+    }
+  }
+
+  const searchResult = await player.search(query, {
+    requestedBy: msg.author,
+    searchEngine: QueryType.AUTO
+  });
+
+  // е) Если ничего не найдено, сообщаем
+  if (!searchResult || !searchResult.tracks.length) {
+    return msg.reply('❌ Ничего не найдено по запросу.');
+  }
+
+  // ж) Берём первый трек
   const track = searchResult.tracks[0];
-  queue.play(track);
 
-  // отправляем в чат сообщение о том, что трек поставлен
-  msg.reply(`▶️ Добавлен в очередь: **${track.title}**`);
+  // з) Добавляем трек в очередь и запускаем воспроизведение, если не играет
+  queue.addTrack(track);
+  if (!queue.isPlaying()) {
+    await queue.node.play();
+  }
+
+  // и) Отправляем сообщение с кнопкой «Pause»
+  const pauseButton = new ButtonBuilder()
+    .setCustomId('pause')
+    .setLabel('⏸ Pause')
+    .setStyle(ButtonStyle.Secondary);
+
+  const row = new ActionRowBuilder().addComponents(pauseButton);
+
+  await msg.reply({
+    content: `⏳ В очередь добавлен: **${track.title}** (поз. #${queue.getSize()})`,
+    components: [row]
+  });
 });
 
-// Обрабатываем ошибки плеера
-player.on('error', (queue, error) => {
-  console.error(`При проигрывании в ${queue.guild.name} произошла ошибка: ${error.message}`);
-  queue.metadata.channel.send('❌ Что-то пошло не так при воспроизведении.');
-});
+// 6) Обработка нажатий на кнопки Pause/Resume
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.type !== InteractionType.MessageComponent) return;
 
-player.on('connectionError', (queue, error) => {
-  console.error(`Не удалось подключиться к каналу в ${queue.guild.name}: ${error.message}`);
-  queue.metadata.channel.send('❌ Не удалось подключиться к голосовому каналу.');
-});
+  const queue = useQueue(interaction.guild.id);
+  if (!queue) {
+    return interaction.reply({ content: '❌ Нет активной очереди.', ephemeral: true });
+  }
 
-// Пример: по событию завершения трека можно отправить сообщение
-player.on('playerStart', (queue, track) => {
-  queue.metadata.channel.send(`▶️ Сейчас играет: **${track.title}**`);
+  // Paused → Resume
+  if (interaction.customId === 'pause') {
+    if (queue.node.isPaused()) {
+      return interaction.reply({ content: '⚠️ Уже на паузе.', ephemeral: true });
+    }
+    queue.node.pause();
+
+    const resumeBtn = new ButtonBuilder()
+      .setCustomId('resume')
+      .setLabel('▶️ Resume')
+      .setStyle(ButtonStyle.Primary);
+    const resumeRow = new ActionRowBuilder().addComponents(resumeBtn);
+
+    return interaction.update({
+      content: '⏸ Музыка поставлена на паузу',
+      components: [resumeRow]
+    });
+  }
+
+  // Resume → Pause
+  if (interaction.customId === 'resume') {
+    if (!queue.node.isPaused()) {
+      return interaction.reply({ content: '⚠️ Трек уже играет.', ephemeral: true });
+    }
+    queue.node.resume();
+
+    const pauseBtn = new ButtonBuilder()
+      .setCustomId('pause')
+      .setLabel('⏸ Pause')
+      .setStyle(ButtonStyle.Secondary);
+    const pauseRow = new ActionRowBuilder().addComponents(pauseBtn);
+
+    return interaction.update({
+      content: '▶️ Музыка продолжена',
+      components: [pauseRow]
+    });
+  }
 });
 
 client.login(process.env.DISCORD_TOKEN);
