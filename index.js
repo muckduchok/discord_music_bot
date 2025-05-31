@@ -1,154 +1,92 @@
+// index.js
 import 'dotenv/config';
-import { spawn } from 'child_process';
-import { Client, GatewayIntentBits, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, InteractionType } from 'discord.js';
-import {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  StreamType
-} from '@discordjs/voice';
+import { Client, GatewayIntentBits } from 'discord.js';
+import { Player, QueryType, QueueRepeatMode } from 'discord-player';
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-// Хранилище плееров по guildId
-const players = new Map();
+const player = new Player(client, {
+  ytdlOptions: {
+    // можно уточнить опции, но по умолчанию Discord Player сам
+    // попытается использовать yt-dlp и cookies, если нужно
+    filter: 'audioonly',
+    quality: 'highestaudio',
+    highWaterMark: 1 << 25,
+  },
+  // опционально: можно настроить, как обрабатывать плейлисты, очередь и т.п.
+  // extractors: [ new YtDlpExtractor() ]  // в новых версиях он идёт “из коробки”
+});
 
-client.once(Events.ClientReady, () => {
+client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
-client.on('error', console.error);
-process.on('unhandledRejection', console.error);
 
-client.on(Events.MessageCreate, async msg => {
+client.on('messageCreate', async (msg) => {
   if (msg.author.bot || !msg.content.startsWith('!play ')) return;
 
-  // 1) Extract and clean the URL
-  const raw = msg.content.slice('!play '.length).trim().split(/\s+/)[0];
-  if (!raw) return msg.reply('❌ Укажи ссылку: `!play https://youtu.be/…`');
+  // забираем аргумент после "!play "
+  const query = msg.content.slice('!play '.length).trim();
+  if (!query) return msg.reply('Укажи, что играть, например: `!play Never Gonna Give You Up`');
 
-  const url = raw.replace(/^<|>$/g, '').trim();
-  const m = url.match(/[?&]v=([^&]+)/);
-  if (!m) return msg.reply('❌ Нужна ссылка с `?v=<ID>`.');
-  const cleanUrl = `https://www.youtube.com/watch?v=${m[1]}`;
+  // получаем очередь (создадим, если ещё нет)
+  const queue = player.createQueue(msg.guild, {
+    metadata: {
+      channel: msg.channel,
+      requestedBy: msg.author.username,
+    },
+    // указываем, что делать, если в очереди несколько треков
+    leaveOnEnd: false,
+    leaveOnEmpty: true,
+    leaveOnStop: true,
+    leaveOnEmptyCooldown: 300000, // 5 минут
+  });
 
-  // 2) Cookie header
-  const cookieHeader = process.env.CHROME_COOCKIES;
-  if (!cookieHeader) return msg.reply('❌ Не задана переменная CHROME_COOCKIES в .env');
-
-  console.log('→ Streaming with cookies:', cookieHeader.split(';')[0] + '…');
-
-  // 3) Spawn yt-dlp with --add-header
-  let proc;
   try {
-    proc = spawn('yt-dlp', [
-      '-f', 'bestaudio',
-      '-o', '-',
-      '--quiet',
-      '--add-header', `Cookie: ${cookieHeader}`,
-      cleanUrl
-    ], { stdio: ['ignore','pipe','inherit'] });
-  } catch (e) {
-    console.error('yt-dlp spawn error:', e);
-    return msg.reply('❌ Не удалось запустить yt-dlp. Проверь установку.');
+    if (!queue.connection) await queue.connect(msg.member.voice.channel);
+  } catch {
+    return msg.reply('Не смог подключиться к вашему голосовому каналу.');
   }
 
-  const stream = proc.stdout;
-  if (!stream) return msg.reply('❌ yt-dlp не дал потока.');
+  // ищем трек (queryType можно “auto”, можно “video” для прямых ссылок)
+  const searchResult = await player
+    .search(query, {
+      requestedBy: msg.author.username,
+      searchEngine: QueryType.AUTO,
+    })
+    .catch(() => null);
 
-  // 4) Join voice channel
-  const vc = msg.member.voice.channel;
-  if (!vc) return msg.reply('❌ Зайди в голосовой канал.');
+  if (!searchResult || !searchResult.tracks.length)
+    return msg.reply('Ничего не найдено по запросу.');
 
-  const conn = joinVoiceChannel({
-    channelId: vc.id,
-    guildId: msg.guild.id,
-    adapterCreator: msg.guild.voiceAdapterCreator
-  });
+  // добавляем первый трек в очередь
+  const track = searchResult.tracks[0];
+  queue.play(track);
 
-  // 5) Play
-  const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
-  let done = false;
-  const cleanup = () => { if (!done) { done = true; conn.destroy(); } };
-
-  const player = createAudioPlayer()
-    .once(AudioPlayerStatus.Idle, cleanup)
-    .once('error', err => { console.error(err); cleanup(); });
-
-  conn.subscribe(player);
-  player.play(resource);
-
-  // Сохраняем плеер для кнопок
-  players.set(msg.guild.id, player);
-
-  // 6) Отправляем сообщение с кнопкой «Pause»
-  const pauseButton = new ButtonBuilder()
-    .setCustomId('pause')
-    .setLabel('⏸ Pause')
-    .setStyle(ButtonStyle.Secondary);
-  const row = new ActionRowBuilder().addComponents(pauseButton);
-
-  await msg.reply({
-    content: `▶️ Играю https://youtu.be/${m[1]}`,
-    components: [row]
-  });
+  // отправляем в чат сообщение о том, что трек поставлен
+  msg.reply(`▶️ Добавлен в очередь: **${track.title}**`);
 });
 
-// Обработка нажатий на кнопки
-client.on(Events.InteractionCreate, async interaction => {
-  if (interaction.type !== InteractionType.MessageComponent) return;
+// Обрабатываем ошибки плеера
+player.on('error', (queue, error) => {
+  console.error(`При проигрывании в ${queue.guild.name} произошла ошибка: ${error.message}`);
+  queue.metadata.channel.send('❌ Что-то пошло не так при воспроизведении.');
+});
 
-  const player = players.get(interaction.guildId);
-  if (!player) {
-    return interaction.reply({ content: '❌ Плеер не найден.', ephemeral: true });
-  }
+player.on('connectionError', (queue, error) => {
+  console.error(`Не удалось подключиться к каналу в ${queue.guild.name}: ${error.message}`);
+  queue.metadata.channel.send('❌ Не удалось подключиться к голосовому каналу.');
+});
 
-  // PAUSE
-  if (interaction.customId === 'pause') {
-    if (player.state.status === AudioPlayerStatus.Paused) {
-      return interaction.reply({ content: 'Уже на паузе.', ephemeral: true });
-    }
-    player.pause();
-
-    // Меняем кнопку на «Resume»
-    const resumeBtn = new ButtonBuilder()
-      .setCustomId('resume')
-      .setLabel('▶️ Resume')
-      .setStyle(ButtonStyle.Primary);
-    const resumeRow = new ActionRowBuilder().addComponents(resumeBtn);
-
-    return interaction.update({
-      content: '⏸ Музыка поставлена на паузу',
-      components: [resumeRow]
-    });
-  }
-
-  // RESUME
-  if (interaction.customId === 'resume') {
-    if (player.state.status !== AudioPlayerStatus.Paused) {
-      return interaction.reply({ content: 'Музыка не на паузе.', ephemeral: true });
-    }
-    player.unpause();
-
-    // Меняем кнопку обратно на «Pause»
-    const pauseBtn = new ButtonBuilder()
-      .setCustomId('pause')
-      .setLabel('⏸ Pause')
-      .setStyle(ButtonStyle.Secondary);
-    const pauseRow = new ActionRowBuilder().addComponents(pauseBtn);
-
-    return interaction.update({
-      content: '▶️ Музыка продолжена',
-      components: [pauseRow]
-    });
-  }
+// Пример: по событию завершения трека можно отправить сообщение
+player.on('playerStart', (queue, track) => {
+  queue.metadata.channel.send(`▶️ Сейчас играет: **${track.title}**`);
 });
 
 client.login(process.env.DISCORD_TOKEN);
